@@ -13,6 +13,7 @@ declare(strict_types=1);
 
 namespace Rollerworks\Component\Search\ApiPlatform\Elasticsearch\Extension;
 
+use ApiPlatform\Core\Bridge\Doctrine\Orm\Extension\ContextAwareQueryResultCollectionExtensionInterface;
 use ApiPlatform\Core\Bridge\Doctrine\Orm\Extension\QueryCollectionExtensionInterface;
 use ApiPlatform\Core\Bridge\Doctrine\Orm\Util\QueryNameGeneratorInterface;
 use Doctrine\Common\Persistence\ManagerRegistry;
@@ -22,6 +23,7 @@ use Elastica\Document;
 use Elastica\Query;
 use Elastica\Search;
 use Rollerworks\Component\Search\ApiPlatform\ArrayKeysValidator;
+use Rollerworks\Component\Search\ApiPlatform\DataProvider\PrecountedPaginator;
 use Rollerworks\Component\Search\Elasticsearch\ElasticsearchFactory;
 use Rollerworks\Component\Search\Exception\BadMethodCallException;
 use Rollerworks\Component\Search\SearchCondition;
@@ -30,13 +32,14 @@ use Symfony\Component\HttpFoundation\RequestStack;
 /**
  * Class SearchExtension.
  */
-class SearchExtension implements QueryCollectionExtensionInterface
+class SearchExtension implements QueryCollectionExtensionInterface, ContextAwareQueryResultCollectionExtensionInterface
 {
     private $requestStack;
     private $registry;
     private $elasticsearchFactory;
     private $client;
     private $identifierNames = [];
+    private $paginator;
 
     public function __construct(RequestStack $requestStack, ManagerRegistry $registry, ElasticsearchFactory $elasticsearchFactory, Client $client)
     {
@@ -46,8 +49,26 @@ class SearchExtension implements QueryCollectionExtensionInterface
         $this->client = $client;
     }
 
+    /**
+     * @inheritDoc
+     */
+    public function supportsResult(string $resourceClass, string $operationName = null, array $context = []): bool
+    {
+        return null !== $this->paginator;
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function getResult(QueryBuilder $queryBuilder, string $resourceClass = null, string $operationName = null, array $context = [])
+    {
+        return new PrecountedPaginator($queryBuilder->getQuery()->getResult(), ...$this->paginator);
+    }
+
     public function applyToCollection(QueryBuilder $queryBuilder, QueryNameGeneratorInterface $queryNameGenerator, string $resourceClass, string $operationName = null)
     {
+        $this->paginator = null;
+
         $request = $this->requestStack->getCurrentRequest();
 
         /** @var SearchCondition|null $condition */
@@ -104,11 +125,10 @@ class SearchExtension implements QueryCollectionExtensionInterface
         // move limit/offset from QueryBuilder to Elasticsearch query
         if (null !== $firstResult = $queryBuilder->getFirstResult()) {
             $query->setFrom($firstResult);
-            $queryBuilder->setFirstResult(null);
+            $queryBuilder->setFirstResult(0);
         }
         if (null !== $maxResults = $queryBuilder->getMaxResults()) {
             $query->setSize($maxResults);
-            $queryBuilder->setMaxResults(null);
         }
 
         $search = new Search($this->client);
@@ -121,6 +141,8 @@ class SearchExtension implements QueryCollectionExtensionInterface
                 ->addType($type);
         }
         $response = $search->search($query);
+
+        $this->paginator = [$firstResult, $maxResults, $response->getTotalHits()];
 
         // NOTE: written like this so we only check if we have a normalizer once
         if (null !== $normalizer) {
